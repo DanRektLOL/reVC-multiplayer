@@ -24,8 +24,7 @@
 -dontskipnonpubliclibraryclasses
 -verbose
 
-# If you want to enable optimization, you should include the comenta o proguard pra ve
-# following:
+# Optimization settings.
  -optimizations !code/simplification/arithmetic,!code/simplification/cast,!field/*,!class/merging/*
  -optimizationpasses 5
  -allowaccessmodification
@@ -117,9 +116,6 @@
     void hapticRun(int, float, int);
     void hapticStop(int);
 }
-
- -dontwarn com.revc.game.MainActivity*
- -keep class com.revc.game.MainActivity { *; }
 
  -dontwarn androidx.**
  -keep class androidx.** { *; }

@@ -2,34 +2,130 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
+// v0.1.0 -> "0.1.0"; anything not a tag -> "dev". Set once, used for both the name and
+// the code, and passed down to CMake so the native side cannot disagree with the APK.
+// GITVERSE_REF_NAME first, GITHUB_REF_NAME after it: the fork builds on GitVerse now, and
+// their runner still sets the GitHub-shaped name for compatibility.
+def revcVersion = {
+    def t = System.getenv("GITVERSE_REF_NAME") ?: System.getenv("GITHUB_REF_NAME")
+    (t != null && t ==~ /v\d+\.\d+\.\d+/) ? t.substring(1) : "dev"
+}()
+
+// Which ABIs the native side is built for. Both by default, as always; CI asks for one at
+// a time with -PrevcAbi=arm64-v8a, because a job there is killed at fifteen minutes and
+// two architectures of Jolt do not fit into them. One APK per architecture is then what
+// ships — a phone needs one of them, not both.
+def revcAbis = (project.findProperty('revcAbi') ?: 'armeabi-v7a,arm64-v8a')
+        .toString().split(',').collect { it.trim() }
+
+// major*10000 + minor*100 + patch, so 0.1.0 = 100 - comfortably above the hand-written 4
+// that the old releases stopped at, and monotonic without anyone having to remember.
+// A dev build gets 1: valid, and lower than any release, so it never blocks one.
+def revcVersionCode = {
+    if (revcVersion == "dev") return 1
+    def p = revcVersion.tokenize('.')
+    p[0].toInteger() * 10000 + p[1].toInteger() * 100 + p[2].toInteger()
+}()
+
 android {
 
     namespace 'com.revc.game'
     compileSdk 35
+    ndkVersion '30.0.15729638'
 
     defaultConfig {
         applicationId "com.revc.game"
-        minSdk 24
+        minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName "reVC-0.0.1"
-
-        ndkVersion '27.2.12479018'
+        // The TAG is the version, and the only place it lives - see the top of this file.
+        // The ref name is what a release build hands us; anything else is a dev build and
+        // says so, rather than quietly claiming to be a release. versionCode is DERIVED,
+        // because Android refuses a downgrade and hand-maintaining it is what let the three
+        // copies of this number drift apart in the first place.
+        versionCode revcVersionCode
+        versionName "reVC-${revcVersion}"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters "armeabi-v7a"/*, "arm64-v8a"*/
+            abiFilters.clear()
+            abiFilters.addAll(revcAbis)
+        }
+
+        // -PrevcVulkan builds the Vulkan backend instead of GLES3. Experimental, and the
+        // flag lives in defaultConfig so both build types inherit it: the release block's
+        // own arguments() call replaces its list rather than adding to it.
+        if (project.hasProperty('revcVulkan')) {
+            externalNativeBuild { cmake { arguments '-DLIBRW_PLATFORM=VULKAN' } }
+        }
+    }
+
+    // Build stock and Jolt-ragdoll variants separately. Same applicationId, so a ragdoll
+    // APK installs over a stock one and vice versa (interchangeable) — they're told apart
+    // by the version name, which for ragdoll appends the Jolt version read from its header.
+    def joltVersion = {
+        try {
+            def core = file("$rootDir/../../vendor/JoltPhysics/Jolt/Core/Core.h").text
+            def field = { p -> (core =~ /JPH_VERSION_$p\s+(\d+)/)[0][1] }
+            "${field('MAJOR')}.${field('MINOR')}.${field('PATCH')}"
+        } catch (ignored) { "unknown" }
+    }()
+    flavorDimensions += "physics"
+    productFlavors {
+        stock {
+            dimension "physics"
+            externalNativeBuild { cmake { arguments "-DREVC_RAGDOLL=OFF" } }
+        }
+        ragdoll {
+            dimension "physics"
+            versionNameSuffix "+jolt-${joltVersion}"
+            externalNativeBuild { cmake { arguments "-DREVC_RAGDOLL=ON" } }
+        }
+    }
+
+    // The release key comes from CI, never from the repository. Everything here is read
+    // from the environment, so a checkout carries no key material at all and *.keystore is
+    // gitignored besides.
+    //
+    // Why it has to be a fixed key: both build types used signingConfigs.debug before, which
+    // means Gradle's ~/.android/debug.keystore - and a CI runner has none, so it made a fresh
+    // one every run. Checked on the old releases: v0.0.1 is signed with c8042f79... and
+    // v0.0.3 with b814bd3d..., so nobody could update from one to the other. Android refuses
+    // an update signed with a different key and the only way across is uninstall, which takes
+    // the save data with it.
+    //
+    // A LOCAL build has no secret and falls back to the debug key, which is right: local
+    // builds are for testing and personal use, and they are not what anyone installs over.
+    signingConfigs {
+        revc {
+            def ks = System.getenv("REVC_KEYSTORE")
+            if (ks != null && file(ks).exists()) {
+                storeFile file(ks)
+                storePassword System.getenv("REVC_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("REVC_KEY_ALIAS")
+                keyPassword System.getenv("REVC_KEY_PASSWORD")
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            signingConfig System.getenv("REVC_KEYSTORE") ? signingConfigs.revc : signingConfigs.debug
 
             externalNativeBuild {
                 cmake {
                     cppFlags '-O3', '-fvisibility=hidden'
+                    // One arguments() call: a second would replace this list, not add to it.
+                    // REVC_DEVTOOLS=OFF is the clean build - no REVC_* debug hooks in a
+                    // release APK.
+                    // ccache when -PrevcCcache is passed: CI runs against a fifteen-minute
+                    // ceiling and the native build is what fills it. Off by default, so a
+                    // machine without ccache installed is unaffected.
+                    arguments(*([
+                        "-DREVC_VERSION=${revcVersion}".toString(), '-DREVC_DEVTOOLS=OFF'
+                    ] + (project.hasProperty('revcCcache') ? [
+                        '-DCMAKE_C_COMPILER_LAUNCHER=ccache', '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'
+                    ] : [])))
                 }
             }
 
@@ -37,7 +133,6 @@ android {
             minifyEnabled true
             shrinkResources true
             jniDebuggable false
-            renderscriptDebuggable false
 
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
@@ -54,7 +149,6 @@ android {
             debuggable true
             minifyEnabled false
             jniDebuggable true
-            renderscriptDebuggable true
         }
     }
 
@@ -76,7 +170,6 @@ android {
     }
 
     buildFeatures {
-        viewBinding true
         buildConfig = true
     }
 

@@ -9,6 +9,7 @@ import android.content.Context;
 import android.os.Build;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -545,7 +546,23 @@ class SDLHapticHandler {
             SDLHaptic haptic = getHaptic(deviceIds[i]);
             if (haptic == null) {
                 InputDevice device = InputDevice.getDevice(deviceIds[i]);
-                Vibrator vib = device.getVibrator();
+                // Android 12 moved input-device motors behind a VibratorManager, and
+                // getVibrator() on such a device answers with a NullVibrator whose
+                // hasVibrator() is false. Upstream SDL still asks the old way, which is why
+                // a gamepad never showed up as a haptic device on a modern phone.
+                Vibrator vib = null;
+                if (Build.VERSION.SDK_INT >= 31 /* Android 12 (S) */) {
+                    VibratorManager vm = device.getVibratorManager();
+                    if (vm != null) {
+                        int[] vibIds = vm.getVibratorIds();
+                        Log.v("SDL", "haptic scan: device " + deviceIds[i] + " (" + device.getName()
+                              + ") vibrators=" + vibIds.length);
+                        if (vibIds.length > 0)
+                            vib = vm.getVibrator(vibIds[0]);
+                    }
+                }
+                if (vib == null)
+                    vib = device.getVibrator();
                 if (vib != null) {
                     if (vib.hasVibrator()) {
                         haptic = new SDLHaptic();
