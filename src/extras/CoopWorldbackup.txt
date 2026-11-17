@@ -1,0 +1,1168 @@
+#include "Net.h"
+#include "common.h"
+#include "platform.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "Automobile.h"
+#include "ModelIndices.h"
+#include "ModelInfo.h"
+#include "Pools.h"
+#include "Streaming.h"
+#include "Vehicle.h"
+#include "VehicleModelInfo.h"
+#include "World.h"
+#if COOP_ALLVEH
+#include "Bike.h"
+#include "Boat.h"
+#include "Heli.h"
+#include "Plane.h"
+#endif
+#include "AnimBlendAssociation.h"
+#include "AnimBlendHierarchy.h"
+#include "AnimManager.h"
+#include "CivilianPed.h"
+#include "Clock.h"
+#include "Fire.h"
+#include "Population.h"
+#include "RpAnimBlend.h"
+#include "Weather.h"
+
+namespace CoopWorld
+{
+
+static const int MAX_SEND_VEH = 60;
+static const int MAX_SEND_PED = 70;
+static const int MAX_VPUP = 80;
+static const int MAX_PPUP = 100;
+static const int MAXC = 256;
+static const float VEH_RANGE = 200.0f;
+static const float PED_RANGE = 130.0f;
+static const float SHARE_ENTER = 220.0f; // closer than this: shared world
+static const float SHARE_LEAVE = 300.0f; // farther than this: independent worlds
+
+static bool hostShared = false;
+static bool guestShared = false;
+static double lastWorldSend = 0, lastEntSend = 0, lastFireSend = 0;
+static int32 guestOwnedId = -1; // host: the car the guest is driving
+
+// ---- puppets on the guest ----
+static CVehicle *vcar[MAX_VPUP];
+static int32 vid[MAX_VPUP];
+static uint8 vflags[MAX_VPUP], vfree[MAX_VPUP], vtype[MAX_VPUP];
+static uint8 vdmg[MAX_VPUP][13];
+static double vlast[MAX_VPUP];
+static CPed *pped[MAX_PPUP];
+static int32 pid[MAX_PPUP];
+static int32 pveh[MAX_PPUP];
+static double plast[MAX_PPUP];
+
+static int dbgCars = 0, dbgPeds = 0, dbgSeated = 0;
+static char hintBuf[96] = "";
+static double hintUntil = 0;
+static char seatDbg[80] = "";
+
+static void
+SetHint(const char *s)
+{
+	snprintf(hintBuf, sizeof hintBuf, "%s", s);
+	hintUntil = CoopNet::Time() + 3.0;
+}
+
+const char *
+GetHint()
+{ return CoopNet::Time() < hintUntil ? hintBuf : nullptr; }
+
+void
+DebugLine(char *out, int n)
+{
+	if(CoopNet::GetState() == CoopNet::CLIENT)
+		snprintf(out, n, "puppet vehicles %d  puppet peds %d (seated %d)  %s", dbgCars, dbgPeds, dbgSeated, seatDbg);
+	else if(CoopNet::GetState() == CoopNet::HOST)
+		snprintf(out, n, "guest drives vehicle %d  %s", (int)guestOwnedId, seatDbg);
+	else
+		out[0] = 0;
+}
+
+bool
+IsShared()
+{
+	CoopNet::State st = CoopNet::GetState();
+	if(st == CoopNet::HOST) return hostShared;
+	if(st == CoopNet::CLIENT) return guestShared;
+	return false;
+}
+
+bool
+IsGuest()
+{ return CoopNet::GetState() == CoopNet::CLIENT && CoopNet::PacketsReceived() > 0 && guestShared; }
+
+// =====================================================================
+// seating
+//
+// CPed::WarpPedIntoCar only seats a ped that already has an
+// OBJECTIVE_ENTER_CAR_AS_DRIVER / _AS_PASSENGER objective; without one it
+// returns early and leaves the ped half-seated and invisible. The game's own
+// script command sets the objective first, so we do the same.
+// =====================================================================
+static int
+PaxLimit(CVehicle *v)
+{
+	int m = (int)v->m_nNumMaxPassengers;
+	return m > 4 ? 4 : m; // WarpPedIntoCar only fills the first 4 slots
+}
+
+int
+FreePassengerSlots(CVehicle *v)
+{
+	if(v == nil) return 0;
+	int n = 0, m = PaxLimit(v);
+	for(int i = 0; i < m; i++)
+		if(v->pPassengers[i] == nil) n++;
+	return n;
+}
+
+static int
+CountPassengers(CVehicle *v)
+{
+	int n = 0;
+	for(int i = 0; i < 8; i++)
+		if(v->pPassengers[i] != nil) n++;
+	return n;
+}
+
+bool
+SeatPed(CPed *p, CVehicle *car, bool asDriver)
+{
+	if(p == nil || car == nil) return false;
+
+	bool ok = false;
+	if(asDriver) {
+		if(car->pDriver == nil || car->pDriver == p) {
+			p->SetObjective(OBJECTIVE_ENTER_CAR_AS_DRIVER, car);
+			p->WarpPedIntoCar(car);
+			ok = (car->pDriver == p);
+			if(ok && p == FindPlayerPed()) car->SetStatus(STATUS_PLAYER);
+		}
+	} else if(FreePassengerSlots(car) > 0) {
+		int before = CountPassengers(car);
+		p->SetObjective(OBJECTIVE_ENTER_CAR_AS_PASSENGER, car);
+		p->WarpPedIntoCar(car);
+		int added = CountPassengers(car) - before;
+		if(added > 0) {
+			car->m_nNumPassengers += (uint8)added; // WarpPedIntoCar does not count them
+			ok = true;
+		}
+	}
+	snprintf(seatDbg, sizeof seatDbg, "seat %s: %s", asDriver ? "driver" : "passenger", ok ? "ok" : "FAILED");
+	return ok;
+}
+
+void
+UnseatPed(CPed *p)
+{
+	if(p == nil) return;
+	CVehicle *car = p->m_pMyVehicle;
+	if(p->bInVehicle && car != nil) {
+		if(car->pDriver == p)
+			car->RemoveDriver();
+		else
+			car->RemovePassenger(p);
+	}
+	p->bInVehicle = false;
+	p->m_pMyVehicle = nil;
+}
+
+// ---- vehicle types ----
+static int
+VehType(CVehicle *v)
+{
+	if(v == nil) return -1;
+#if COOP_ALLVEH
+	CBaseModelInfo *mi = CModelInfo::GetModelInfo(v->GetModelIndex());
+	if(mi == nil || mi->GetModelType() != MITYPE_VEHICLE) return -1;
+	switch(((CVehicleModelInfo *)mi)->m_vehicleType) {
+	case VEHICLE_TYPE_CAR: return 0;
+	case VEHICLE_TYPE_BIKE: return 1;
+	case VEHICLE_TYPE_BOAT: return 2;
+	case VEHICLE_TYPE_HELI: return 3;
+	case VEHICLE_TYPE_PLANE: return 4;
+	}
+	return -1;
+#else
+	return v->IsCar() ? 0 : -1;
+#endif
+}
+
+static CVehicle *
+MakeVehicle(int type, int model)
+{
+	switch(type) {
+	case 0: return new CAutomobile(model, MISSION_VEHICLE);
+#if COOP_ALLVEH
+	case 1: return new CBike(model, MISSION_VEHICLE);
+	case 2: return new CBoat(model, MISSION_VEHICLE);
+	case 3: return new CHeli(model, MISSION_VEHICLE);
+	case 4: return new CPlane(model, MISSION_VEHICLE);
+#endif
+	}
+	return nil;
+}
+
+static CVehicle *
+PuppetCarById(int32 id)
+{
+	for(int k = 0; k < MAX_VPUP; k++)
+		if(vcar[k] && vid[k] == id) return vcar[k];
+	return nil;
+}
+
+CVehicle *
+ResolveVehicle(int32_t id)
+{
+	if(id < 0) return nil;
+	CoopNet::State st = CoopNet::GetState();
+	if(st == CoopNet::HOST) return CPools::GetVehiclePool()->GetAt(id);
+	if(st == CoopNet::CLIENT) return PuppetCarById(id);
+	return nil;
+}
+
+int32_t
+GetVehicleId(CVehicle *v)
+{
+	if(v == nil) return -1;
+	CoopNet::State st = CoopNet::GetState();
+	if(st == CoopNet::HOST) {
+		if(VehType(v) < 0) return -1;
+		return CPools::GetVehiclePool()->GetIndex(v);
+	}
+	if(st == CoopNet::CLIENT) {
+		for(int k = 0; k < MAX_VPUP; k++)
+			if(vcar[k] == v) return vid[k];
+	}
+	return -1;
+}
+
+static int
+SeatOf(CVehicle *v, CPed *p)
+{
+	if(v->pDriver == p) return 0;
+	for(int i = 0; i < 8; i++)
+		if(v->pPassengers[i] == p) return i + 1;
+	return 1;
+}
+
+bool
+GetLocalRiding(int32_t &vehId, uint8_t &seat)
+{
+	CPed *pl = FindPlayerPed();
+	if(pl == nil || !pl->bInVehicle || pl->m_pMyVehicle == nil) return false;
+	CVehicle *v = pl->m_pMyVehicle;
+	int32_t id = GetVehicleId(v);
+	if(id < 0) return false;
+	vehId = id;
+	seat = (uint8_t)SeatOf(v, pl);
+	return true;
+}
+
+// =====================================================================
+// vehicle state -> network
+// =====================================================================
+static int16
+PackS(float f, float scale)
+{
+	float v = f * scale;
+	if(v > 32767.0f) v = 32767.0f;
+	if(v < -32767.0f) v = -32767.0f;
+	return (int16)v;
+}
+
+static void
+FillVehNet(CoopNet::VehNet &n, CVehicle *v, int32 id, int type)
+{
+	memset(&n, 0, sizeof n);
+	CVector pos = v->GetPosition();
+	CVector f = v->GetForward(), u = v->GetUp();
+	CVector ms = v->m_vecMoveSpeed;
+	n.id = id;
+	n.type = (uint8)type;
+	n.model = (int16)v->GetModelIndex();
+	n.col1 = (uint8)v->m_currentColour1;
+	n.col2 = (uint8)v->m_currentColour2;
+	if(v->bLightsOn) n.flags |= 1;
+	if(v->bEngineOn) n.flags |= 2;
+	if(v->m_fBrakePedal > 0.3f) n.flags |= 4;
+	if(v->m_fGasPedal < -0.1f) n.flags |= 8;
+	if(v->pDriver) n.flags |= 16;
+	if(v == FindPlayerVehicle() && CoopNet::GetState() == CoopNet::HOST) n.flags |= 32;
+
+	n.freeSeats = (uint8)FreePassengerSlots(v);
+	float hp = v->m_fHealth * 0.25f;
+	n.health = (uint8)(hp < 0.0f ? 0.0f : (hp > 250.0f ? 250.0f : hp));
+
+	float st = v->m_fSteerAngle;
+	if(st > 0.7f) st = 0.7f;
+	if(st < -0.7f) st = -0.7f;
+	n.steer = (int8)(st / 0.7f * 127.0f);
+
+	n.x = pos.x;
+	n.y = pos.y;
+	n.z = pos.z;
+	n.fwd[0] = PackS(f.x, 32767.0f);
+	n.fwd[1] = PackS(f.y, 32767.0f);
+	n.fwd[2] = PackS(f.z, 32767.0f);
+	n.up[0] = PackS(u.x, 32767.0f);
+	n.up[1] = PackS(u.y, 32767.0f);
+	n.up[2] = PackS(u.z, 32767.0f);
+	n.vel[0] = PackS(ms.x, 8192.0f);
+	n.vel[1] = PackS(ms.y, 8192.0f);
+	n.vel[2] = PackS(ms.z, 8192.0f);
+
+#if COOP_DOORS || COOP_DAMAGE
+	if(type == 0) {
+		CAutomobile *a = (CAutomobile *)v;
+#if COOP_DOORS
+		for(int i = 0; i < 6; i++) {
+			float open = a->Doors[i].RetAngleWhenOpen();
+			float r = open != 0.0f ? a->Doors[i].m_fAngle / open : 0.0f;
+			n.doorOpen[i] = (uint8)((r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r)) * 255.0f + 0.5f);
+		}
+#endif
+#if COOP_DAMAGE
+		for(int i = 0; i < 6; i++) n.doorState[i] = (uint8)a->Damage.GetDoorStatus(i);
+		for(int i = 0; i < 7; i++) n.panelState[i] = (uint8)a->Damage.GetPanelStatus(i);
+#endif
+	}
+#endif
+}
+
+// =====================================================================
+// vehicle state <- network
+// =====================================================================
+static void
+ApplyExtras(CVehicle *v, int type, const CoopNet::RemoteVeh &r, uint8 *cache)
+{
+#if COOP_DOORS || COOP_DAMAGE
+	if(type != 0) return;
+	CAutomobile *a = (CAutomobile *)v;
+#if COOP_DOORS
+	for(int i = 0; i < 6; i++) {
+		float open = a->Doors[i].RetAngleWhenOpen();
+		float ang = open * (r.doorOpen[i] / 255.0f);
+		a->Doors[i].m_fAngle = ang;
+		a->Doors[i].m_fPrevAngle = ang;
+	}
+#endif
+#if COOP_DAMAGE
+	bool changed = false;
+	for(int i = 0; i < 6; i++)
+		if(cache[i] != r.doorState[i]) changed = true;
+	for(int i = 0; i < 7; i++)
+		if(cache[6 + i] != r.panelState[i]) changed = true;
+	if(changed) {
+		static const int doorNode[6] = {CAR_BONNET, CAR_BOOT, CAR_DOOR_LF, CAR_DOOR_RF, CAR_DOOR_LR, CAR_DOOR_RR};
+		static const int panelNode[7] = {CAR_WING_LF, CAR_WING_RF, CAR_WING_LR, CAR_WING_RR, CAR_WINDSCREEN, CAR_BUMP_FRONT, CAR_BUMP_REAR};
+		for(int i = 0; i < 6; i++) {
+			if(cache[i] != r.doorState[i]) {
+				a->Damage.SetDoorStatus(i, r.doorState[i]);
+				a->SetDoorDamage(doorNode[i], (eDoors)i, true);
+				cache[i] = r.doorState[i];
+			}
+		}
+		for(int i = 0; i < 7; i++) {
+			if(cache[6 + i] != r.panelState[i]) {
+				a->Damage.SetPanelStatus(i, r.panelState[i]);
+				if(i >= 5)
+					a->SetBumperDamage(panelNode[i], (ePanels)i, true);
+				else
+					a->SetPanelDamage(panelNode[i], (ePanels)i, true);
+				cache[6 + i] = r.panelState[i];
+			}
+		}
+	}
+#endif
+#endif
+}
+
+// drive the vehicle from network data; the owner's machine does the real physics
+static void
+PlaceVehicle(CVehicle *car, const CoopNet::RemoteVeh &r, int type)
+{
+	CVector f(r.fx, r.fy, r.fz), u(r.ux, r.uy, r.uz);
+	CVector right = CrossProduct(f, u);
+	CMatrix &m = car->GetMatrix();
+	CVector oldPos = m.GetPosition();
+	m.GetRight() = right;
+	m.GetForward() = f;
+	m.GetUp() = u;
+	m.GetPosition() = CVector(r.x, r.y, r.z);
+	m.UpdateRW();
+	car->UpdateRwFrame();
+
+	car->m_vecMoveSpeed = CVector(r.vx, r.vy, r.vz);
+	car->m_vecTurnSpeed = CVector(0.0f, 0.0f, 0.0f);
+	car->m_fSteerAngle = r.steer;
+	car->m_fBrakePedal = (r.flags & 4) ? 1.0f : 0.0f;
+	car->m_fGasPedal = (r.flags & 8) ? -1.0f : ((r.vx * r.vx + r.vy * r.vy) > 0.0004f ? 0.5f : 0.0f);
+	car->bLightsOn = (r.flags & 1) != 0;
+	car->bEngineOn = (r.flags & 2) != 0;
+	float hp = r.health * 4.0f;
+	car->m_fHealth = hp < 260.0f ? 260.0f : hp;
+	car->SetStatus((car->pDriver != nil || (r.flags & 16)) ? STATUS_PHYSICS : STATUS_ABANDONED);
+	car->m_nDoorLock = (r.flags & 32) ? CARLOCK_LOCKED : CARLOCK_UNLOCKED;
+	car->bUsesCollision = true;
+	if(type == 3 || type == 4) car->bAffectedByGravity = false;
+
+	if((m.GetPosition() - oldPos).Magnitude() > 15.0f) {
+		CWorld::Remove(car);
+		CWorld::Add(car);
+	}
+}
+
+// =====================================================================
+// host side
+// =====================================================================
+struct Cand {
+	float d;
+	void *p;
+};
+
+static void
+SortCands(Cand *c, int n)
+{
+	for(int i = 1; i < n; i++) {
+		Cand t = c[i];
+		int j = i - 1;
+		while(j >= 0 && c[j].d > t.d) {
+			c[j + 1] = c[j];
+			j--;
+		}
+		c[j + 1] = t;
+	}
+}
+
+static int
+GatherAnims(CPed *p, CoopNet::AnimEntry *out, int maxn)
+{
+	RpClump *clump = (RpClump *)p->m_rwObject;
+	if(clump == nil) return 0;
+
+	CoopNet::AnimEntry list[24];
+	int cnt = 0;
+	for(CAnimBlendAssociation *a = RpAnimBlendClumpGetFirstAssociation(clump); a != nil && cnt < 24; a = RpAnimBlendGetNextAssociation(a)) {
+		if(a->blendAmount < 0.02f) continue;
+		CoopNet::AnimEntry e;
+		e.animId = (uint16)a->animId;
+		e.group = (uint8)a->groupId;
+		float bl = a->blendAmount > 1.0f ? 1.0f : a->blendAmount;
+		e.blend = (uint8)(bl * 255.0f + 0.5f);
+		e.time = a->currentTime;
+		float sp = a->speed < 0.0f ? 0.0f : (a->speed > 3.98f ? 3.98f : a->speed);
+		e.speed = (uint8)(sp * 64.0f + 0.5f);
+		e.flags = (uint8)(a->flags & 0xFF);
+		list[cnt++] = e;
+	}
+	for(int i = 1; i < cnt; i++) {
+		CoopNet::AnimEntry t = list[i];
+		int j = i - 1;
+		while(j >= 0 && list[j].blend < t.blend) {
+			list[j + 1] = list[j];
+			j--;
+		}
+		list[j + 1] = t;
+	}
+	int n = cnt > maxn ? maxn : cnt;
+	for(int i = 0; i < n; i++) out[i] = list[i];
+	return n;
+}
+
+// the guest is driving one of our cars: take our AI out of it and mirror the guest's version
+static void
+HostOwnership()
+{
+	CVehiclePool *vp = CPools::GetVehiclePool();
+	CoopNet::PlayerState rs;
+	int32 want = -1;
+	if(CoopNet::GetRemoteInterp(rs) && (rs.flags & 2) && rs.seat == 0) want = rs.vehId;
+	if(want >= 0) {
+		CVehicle *v = vp->GetAt(want);
+		if(v == nil || v == FindPlayerVehicle() || VehType(v) < 0) want = -1;
+	}
+
+	if(want != guestOwnedId) {
+		if(guestOwnedId >= 0) {
+			CVehicle *old = vp->GetAt(guestOwnedId);
+			if(old) old->SetStatus(STATUS_ABANDONED);
+		}
+		guestOwnedId = want;
+		if(want >= 0) {
+			CVehicle *v = vp->GetAt(want);
+			if(v && v->pDriver && v->pDriver != FindPlayerPed()) {
+				CPopulation::RemovePed(v->pDriver);
+				v->pDriver = nil;
+			}
+		}
+	}
+
+	if(guestOwnedId >= 0) {
+		CVehicle *v = vp->GetAt(guestOwnedId);
+		CoopNet::RemoteVeh r;
+		if(v && CoopNet::GetGuestVehicle(r) && r.id == guestOwnedId) PlaceVehicle(v, r, VehType(v));
+	}
+}
+
+#if COOP_FIRE
+static void
+HostSendFires()
+{
+	static CoopNet::FireNet fs[CoopNet::MAX_FIRES];
+	int n = 0;
+	for(int i = 0; i < NUM_FIRES && n < CoopNet::MAX_FIRES; i++) {
+		CFire &f = gFireManager.m_aFires[i];
+		if(!f.m_bIsOngoing) continue;
+		fs[n].x = f.m_vecPos.x;
+		fs[n].y = f.m_vecPos.y;
+		fs[n].z = f.m_vecPos.z;
+		fs[n].size = 1;
+		n++;
+	}
+	CoopNet::SendFires(fs, n);
+}
+#endif
+
+static void
+HostSend()
+{
+	CPed *player = FindPlayerPed();
+	if(player == nil) return;
+	double now = CoopNet::Time();
+
+	HostOwnership();
+
+	// shared / independent decision (with hysteresis)
+	float gx, gy, gz;
+	CoopNet::GetRemote(gx, gy, gz);
+	CVector gpos(gx, gy, gz);
+	if(CoopNet::PacketsReceived() == 0) {
+		hostShared = false;
+	} else {
+		float dist = (player->GetPosition() - gpos).Magnitude();
+		if(hostShared) {
+			if(dist > SHARE_LEAVE) hostShared = false;
+		} else if(dist < SHARE_ENTER) {
+			hostShared = true;
+		}
+	}
+
+	if(now - lastWorldSend >= 0.1) {
+		CoopNet::WorldNet w;
+		memset(&w, 0, sizeof w);
+		w.hours = (uint8)CClock::ms_nGameClockHours;
+		w.minutes = (uint8)CClock::ms_nGameClockMinutes;
+		w.seconds = (uint8)CClock::ms_nGameClockSeconds;
+		w.oldWeather = (int16)CWeather::OldWeatherType;
+		w.newWeather = (int16)CWeather::NewWeatherType;
+		float iv = CWeather::InterpolationValue;
+		w.interp = (uint8)((iv < 0.0f ? 0.0f : (iv > 1.0f ? 1.0f : iv)) * 255.0f);
+		w.shared = hostShared ? 1 : 0;
+		CoopNet::SendWorld(w);
+		lastWorldSend = now;
+	}
+
+	if(!hostShared) return;
+
+#if COOP_FIRE
+	if(now - lastFireSend >= 0.2) {
+		HostSendFires();
+		lastFireSend = now;
+	}
+#endif
+
+	if(now - lastEntSend < 0.033) return;
+	lastEntSend = now;
+
+	static Cand cand[MAXC];
+	int nc = 0;
+
+	// ---- vehicles (nearest first) ----
+	CVehiclePool *vp = CPools::GetVehiclePool();
+	CVehicle *playerVeh = FindPlayerVehicle();
+	for(int i = 0; i < vp->GetSize() && nc < MAXC; i++) {
+		CVehicle *v = vp->GetSlot(i);
+		if(v == nil || VehType(v) < 0) continue;
+		if(guestOwnedId >= 0 && vp->GetIndex(v) == guestOwnedId) continue; // the guest owns this one right now
+		float d = (v->GetPosition() - gpos).Magnitude();
+		if(v == playerVeh)
+			d = -1.0f; // always send the car the host is in
+		else if(d > VEH_RANGE)
+			continue;
+		cand[nc].d = d;
+		cand[nc].p = v;
+		nc++;
+	}
+	SortCands(cand, nc);
+
+	static CoopNet::VehNet vs[MAX_SEND_VEH];
+	int nv = 0;
+	for(int i = 0; i < nc && nv < MAX_SEND_VEH; i++) {
+		CVehicle *v = (CVehicle *)cand[i].p;
+		FillVehNet(vs[nv], v, vp->GetIndex(v), VehType(v));
+		nv++;
+	}
+	CoopNet::SendVehicles(vs, nv);
+
+	// ---- pedestrians (including drivers and passengers) ----
+	nc = 0;
+	CPedPool *pp = CPools::GetPedPool();
+	for(int i = 0; i < pp->GetSize() && nc < MAXC; i++) {
+		CPed *p = pp->GetSlot(i);
+		if(p == nil || p == player) continue;
+		if(p->GetModelIndex() == MI_PLAYER) continue; // that is the co-op puppet of the other player
+		if(p->bInVehicle) {
+			CVehicle *pv = p->m_pMyVehicle;
+			if(pv == nil || VehType(pv) < 0) continue;
+			if(guestOwnedId >= 0 && vp->GetIndex(pv) == guestOwnedId) continue;
+		}
+		float d = (p->GetPosition() - gpos).Magnitude();
+		if(d > PED_RANGE) continue;
+		cand[nc].d = d;
+		cand[nc].p = p;
+		nc++;
+	}
+	SortCands(cand, nc);
+
+	static CoopNet::PedNet ps[MAX_SEND_PED];
+	int np = 0;
+	for(int i = 0; i < nc && np < MAX_SEND_PED; i++) {
+		CPed *p = (CPed *)cand[i].p;
+		CVector pos = p->GetPosition();
+		CoopNet::PedNet &n = ps[np++];
+		memset(&n, 0, sizeof n);
+		n.id = pp->GetIndex(p);
+		n.model = (int16)p->GetModelIndex();
+		n.moveState = (uint8)p->m_nMoveState;
+		n.x = pos.x;
+		n.y = pos.y;
+		n.z = pos.z;
+		n.heading = p->m_fRotationCur;
+		n.vehId = -1;
+		if(p->bInVehicle) {
+			n.vehId = vp->GetIndex(p->m_pMyVehicle);
+			n.seat = (uint8)SeatOf(p->m_pMyVehicle, p);
+			n.numAnims = 0;
+		} else {
+			n.numAnims = (uint8)GatherAnims(p, n.anims, CoopNet::PED_ANIMS);
+		}
+	}
+	CoopNet::SendPeds(ps, np);
+}
+
+// =====================================================================
+// guest side
+// =====================================================================
+static void
+DeletePuppetPed(int k)
+{
+	if(pped[k] == nil) return;
+	CPed *p = pped[k];
+	pped[k] = nil;
+	pveh[k] = -1;
+	UnseatPed(p);
+	CWorld::Remove(p);
+	delete p;
+}
+
+static void
+DeletePuppetCar(int k)
+{
+	if(vcar[k] == nil) return;
+	CVehicle *car = vcar[k];
+	CPed *pl = FindPlayerPed();
+	if(car == FindPlayerVehicle() || (pl && car->pDriver == pl)) return; // never delete the car the local player is sitting in
+
+	CoopMenu::ReleasePuppetFrom(car);
+	for(int p = 0; p < MAX_PPUP; p++)
+		if(pped[p] && pveh[p] == vid[k]) DeletePuppetPed(p);
+
+	vcar[k] = nil;
+	CWorld::Remove(car);
+	delete car;
+}
+
+static void
+RemoveAllPuppets()
+{
+	for(int i = 0; i < MAX_PPUP; i++) DeletePuppetPed(i);
+	for(int i = 0; i < MAX_VPUP; i++) DeletePuppetCar(i);
+	dbgCars = dbgPeds = dbgSeated = 0;
+}
+
+static void
+ApplyWorld()
+{
+	CoopNet::WorldNet w;
+	if(!CoopNet::GetWorld(w)) return;
+	CClock::ms_nGameClockHours = w.hours;
+	CClock::ms_nGameClockMinutes = w.minutes;
+	CClock::ms_nGameClockSeconds = w.seconds;
+	CWeather::OldWeatherType = w.oldWeather;
+	CWeather::NewWeatherType = w.newWeather;
+	CWeather::InterpolationValue = w.interp / 255.0f;
+	guestShared = (w.shared != 0);
+}
+
+// in shared mode the guest takes its traffic and pedestrians from the host, so drop the local ones
+static void
+ClearLocalAmbient()
+{
+	CVehicle *playerCar = FindPlayerVehicle();
+	CPed *player = FindPlayerPed();
+
+	CVehiclePool *vp = CPools::GetVehiclePool();
+	for(int i = 0; i < vp->GetSize(); i++) {
+		CVehicle *v = vp->GetSlot(i);
+		if(v == nil || v == playerCar) continue;
+		if(v->VehicleCreatedBy != RANDOM_VEHICLE && v->VehicleCreatedBy != PARKED_VEHICLE) continue;
+		if(v->pDriver) {
+			CPopulation::RemovePed(v->pDriver);
+			v->pDriver = nil;
+		}
+		for(int k = 0; k < 8; k++) {
+			if(v->pPassengers[k]) {
+				CPopulation::RemovePed(v->pPassengers[k]);
+				v->pPassengers[k] = nil;
+			}
+		}
+		CWorld::Remove(v);
+		delete v;
+	}
+
+	CPedPool *pp = CPools::GetPedPool();
+	for(int i = 0; i < pp->GetSize(); i++) {
+		CPed *p = pp->GetSlot(i);
+		if(p == nil || p == player || p->bInVehicle) continue;
+		if(p->CharCreatedBy != RANDOM_CHAR) continue;
+		CPopulation::RemovePed(p);
+	}
+}
+
+static bool
+ModelIs(int model, int type)
+{
+	CBaseModelInfo *mi = CModelInfo::GetModelInfo(model);
+	return mi != nil && mi->GetModelType() == type;
+}
+
+static void
+SyncVehicles()
+{
+	static CoopNet::RemoteVeh rv[MAX_VPUP];
+	int n = CoopNet::GetRemoteVehicles(rv, MAX_VPUP);
+	double now = CoopNet::Time();
+	CPed *pl = FindPlayerPed();
+
+	for(int i = 0; i < n; i++) {
+		int slot = -1, freeSlot = -1;
+		for(int k = 0; k < MAX_VPUP; k++) {
+			if(vcar[k] && vid[k] == rv[i].id) {
+				slot = k;
+				break;
+			}
+			if(!vcar[k] && freeSlot < 0) freeSlot = k;
+		}
+		if(slot < 0) {
+			if(freeSlot < 0) continue;
+			int model = rv[i].model;
+			if(!ModelIs(model, MITYPE_VEHICLE)) continue;
+			if(!CStreaming::HasModelLoaded(model)) {
+				CStreaming::RequestModel(model, 0);
+				continue;
+			}
+			CVehicle *car = MakeVehicle(rv[i].type, model);
+			if(car == nil) continue;
+			car->m_currentColour1 = rv[i].col1;
+			car->m_currentColour2 = rv[i].col2;
+			vcar[freeSlot] = car;
+			vid[freeSlot] = rv[i].id;
+			vtype[freeSlot] = rv[i].type;
+			memset(vdmg[freeSlot], 0, sizeof vdmg[freeSlot]);
+			car->RegisterReference((CEntity **)&vcar[freeSlot]);
+			CWorld::Add(car);
+			slot = freeSlot;
+		}
+		vlast[slot] = now;
+		vflags[slot] = rv[i].flags;
+		vfree[slot] = rv[i].freeSeats;
+
+		CVehicle *car = vcar[slot];
+
+		bool isLocalDriver = pl && pl->bInVehicle && car->pDriver == pl;
+
+		if(!isLocalDriver) {
+			PlaceVehicle(car, rv[i], vtype[slot]);
+			ApplyExtras(car, vtype[slot], rv[i], vdmg[slot]);
+		}
+	}
+
+	// Remove old vehicle puppets
+	for(int k = 0; k < MAX_VPUP; k++) {
+		if(vcar[k] && now - vlast[k] > 1.0) DeletePuppetCar(k);
+	}
+}
+
+// ---- pedestrian animation: play exactly what the host ped plays ----
+static void
+HideAssoc(CAnimBlendAssociation *a)
+{
+	a->blendAmount = 0.0f;
+	a->blendDelta = -8.0f;
+	a->flags |= ASSOC_DELETEFADEDOUT;
+}
+
+static void
+SetAssoc(CAnimBlendAssociation *a, const CoopNet::AnimEntry &e, bool justAdded)
+{
+	a->blendAmount = e.blend / 255.0f;
+	a->blendDelta = 0.0f;
+	a->speed = e.speed / 64.0f;
+	a->flags = (uint16)((a->flags & 0xFF00) | (e.flags & ~(ASSOC_DELETEFADEDOUT | ASSOC_FADEOUTWHENDONE)));
+
+	float len = (a->hierarchy != nil) ? a->hierarchy->totalLength : 0.0f;
+	bool repeat = (a->flags & ASSOC_REPEAT) != 0;
+
+	float t = e.time;
+	if(len > 0.01f) {
+		if(repeat)
+			t = fmodf(t, len);
+		else if(t > len)
+			t = len;
+	}
+
+	float diff = t - a->currentTime;
+	if(repeat && len > 0.01f) {
+		while(diff > len * 0.5f) diff -= len;
+		while(diff < -len * 0.5f) diff += len;
+	}
+
+	if(justAdded || fabsf(diff) > 0.08f) a->SetCurrentTime(t);
+}
+
+static void
+ApplyPedAnims(CPed *ped, const CoopNet::PedNet &rs)
+{
+	RpClump *clump = (RpClump *)ped->m_rwObject;
+	if(clump == nil) return;
+
+	bool used[CoopNet::PED_ANIMS] = {false, false, false};
+	int localCount = 0;
+
+	for(CAnimBlendAssociation *a = RpAnimBlendClumpGetFirstAssociation(clump); a != nil; a = RpAnimBlendGetNextAssociation(a)) {
+		localCount++;
+		int match = -1;
+
+		for(int i = 0; i < rs.numAnims; i++) {
+			if(!used[i] && rs.anims[i].animId == (uint16)a->animId && rs.anims[i].group == (uint8)a->groupId) {
+				match = i;
+				break;
+			}
+		}
+
+		if(match >= 0) {
+			used[match] = true;
+			SetAssoc(a, rs.anims[match], false);
+		} else {
+			HideAssoc(a);
+		}
+	}
+
+	int adds = 0;
+	for(int i = 0; i < rs.numAnims; i++) {
+		if(used[i] || rs.anims[i].blend == 0) continue;
+		if(adds >= 2 || localCount > 24) break;
+
+		CAnimBlendAssociation *a = CAnimManager::AddAnimation(clump, (AssocGroupId)rs.anims[i].group, (AnimationId)rs.anims[i].animId);
+		adds++;
+		localCount++;
+
+		if(a != nil) SetAssoc(a, rs.anims[i], true);
+	}
+}
+
+static void
+SyncPeds()
+{
+	static CoopNet::PedNet rp[MAX_PPUP];
+	int n = CoopNet::GetRemotePeds(rp, MAX_PPUP);
+	double now = CoopNet::Time();
+
+	for(int i = 0; i < n; i++) {
+		int slot = -1, freeSlot = -1;
+
+		for(int k = 0; k < MAX_PPUP; k++) {
+			if(pped[k] && pid[k] == rp[i].id) {
+				slot = k;
+				break;
+			}
+			if(!pped[k] && freeSlot < 0) freeSlot = k;
+		}
+
+		// the ped got into or out of a car: rebuild it
+		if(slot >= 0 && pveh[slot] != rp[i].vehId) {
+			DeletePuppetPed(slot);
+			freeSlot = slot;
+			slot = -1;
+		}
+
+		CVector target(rp[i].x, rp[i].y, rp[i].z);
+		if(slot < 0) {
+			if(freeSlot < 0) continue;
+			int model = rp[i].model;
+			if(!ModelIs(model, MITYPE_PED)) continue;
+			if(!CStreaming::HasModelLoaded(model)) {
+				CStreaming::RequestModel(model, 0);
+				continue;
+			}
+			CVehicle *car = nil;
+			bool asDriver = rp[i].seat == 0;
+			if(rp[i].vehId >= 0) {
+				car = PuppetCarById(rp[i].vehId);
+				if(car == nil) continue;                                // its car has not arrived yet
+				if(asDriver && car->pDriver != nil) continue;           // somebody is already driving it
+				if(!asDriver && FreePassengerSlots(car) == 0) continue; // no free seat
+			}
+			CPed *p = new CCivilianPed(PEDTYPE_CIVMALE, model);
+			p->CharCreatedBy = MISSION_CHAR;
+			p->SetPosition(car ? car->GetPosition() : target);
+			CWorld::Add(p);
+			if(car && !SeatPed(p, car, asDriver)) {
+				CWorld::Remove(p);
+				delete p;
+				continue;
+			}
+			pped[freeSlot] = p;
+			pid[freeSlot] = rp[i].id;
+			pveh[freeSlot] = rp[i].vehId;
+			p->RegisterReference((CEntity **)&pped[freeSlot]);
+			slot = freeSlot;
+		}
+		plast[slot] = now;
+
+		if(pveh[slot] >= 0) continue; // seated: the engine poses it from the car
+
+		CPed *p = pped[slot];
+		CWorld::Remove(p);
+		p->SetPosition(target);
+		CWorld::Add(p);
+
+		p->m_vecMoveSpeed = CVector(0.0f, 0.0f, 0.0f);
+		p->m_fRotationCur = rp[i].heading;
+		p->m_fRotationDest = rp[i].heading;
+		p->SetHeading(rp[i].heading);
+		p->m_nMoveState = (decltype(p->m_nMoveState))rp[i].moveState;
+		ApplyPedAnims(p, rp[i]);
+	}
+
+	for(int k = 0; k < MAX_PPUP; k++)
+		if(pped[k] && now - plast[k] > 0.5) DeletePuppetPed(k);
+}
+
+#if COOP_FIRE
+static CFire *gfire[CoopNet::MAX_FIRES];
+
+static void
+SyncFires()
+{
+	static CoopNet::FireNet fr[CoopNet::MAX_FIRES];
+	int n = 0;
+	if(!CoopNet::GetFires(fr, n)) return;
+	bool keep[CoopNet::MAX_FIRES];
+	for(int k = 0; k < CoopNet::MAX_FIRES; k++) keep[k] = false;
+
+	for(int j = 0; j < n; j++) {
+		CVector p(fr[j].x, fr[j].y, fr[j].z);
+		int found = -1;
+		for(int k = 0; k < CoopNet::MAX_FIRES; k++) {
+			if(gfire[k] && gfire[k]->m_bIsOngoing && (gfire[k]->m_vecPos - p).Magnitude() < 2.0f) {
+				found = k;
+				break;
+			}
+		}
+		if(found >= 0) {
+			keep[found] = true;
+			continue;
+		}
+		int freeSlot = -1;
+		for(int k = 0; k < CoopNet::MAX_FIRES; k++) {
+			if(!gfire[k] || !gfire[k]->m_bIsOngoing) {
+				freeSlot = k;
+				break;
+			}
+		}
+		if(freeSlot < 0) continue;
+		gFireManager.StartFire(p, 1.0f, false);
+
+		// StartFire returns void, so find the newly created fire.
+		CFire *f = nil;
+
+		for(int i = 0; i < NUM_FIRES; i++) {
+			CFire &candidate = gFireManager.m_aFires[i];
+
+			if(candidate.m_bIsOngoing && (candidate.m_vecPos - p).Magnitude() < 2.0f) {
+				f = &candidate;
+				break;
+			}
+		}
+
+		gfire[freeSlot] = f;
+
+		if(f) keep[freeSlot] = true;
+	}
+
+	for(int k = 0; k < CoopNet::MAX_FIRES; k++) {
+		if(gfire[k] && !keep[k]) {
+			if(gfire[k]->m_bIsOngoing) gfire[k]->Extinguish();
+			gfire[k] = nil;
+		}
+	}
+}
+#endif
+
+// the guest is the driver of a host car: send its real state to the host
+static void
+GuestSendOwned()
+{
+	CPed *pl = FindPlayerPed();
+	if(pl == nil || !pl->bInVehicle || pl->m_pMyVehicle == nil) return;
+	CVehicle *v = pl->m_pMyVehicle;
+	if(v->pDriver != pl) return;
+	for(int k = 0; k < MAX_VPUP; k++) {
+		if(vcar[k] == v) {
+			CoopNet::VehNet n;
+			FillVehNet(n, v, vid[k], vtype[k]);
+			CoopNet::SendOwnedVehicle(n);
+			return;
+		}
+	}
+}
+
+// G: get into the nearest vehicle that belongs to the other player's world
+void
+TryEnterAsPassenger()
+{
+	CoopNet::State st = CoopNet::GetState();
+	CPed *pl = FindPlayerPed();
+	if(pl == nil) return;
+
+	if(st == CoopNet::HOST) {
+		if(!CoopNet::HasPeer()) {
+			SetHint("G: no guest connected");
+			return;
+		}
+		if(pl->bInVehicle) {
+			SetHint("G: you are already in a vehicle");
+			return;
+		}
+		CVehicle *car = guestOwnedId >= 0 ? CPools::GetVehiclePool()->GetAt(guestOwnedId) : nil;
+		if(car == nil) {
+			SetHint("G: the guest is not driving a vehicle");
+			return;
+		}
+		if((car->GetPosition() - pl->GetPosition()).Magnitude() > 8.0f) {
+			SetHint("G: the guest's vehicle is too far away");
+			return;
+		}
+		SetHint(SeatPed(pl, car, false) ? "Entered as passenger" : "G: that vehicle is full");
+		return;
+	}
+
+	if(st != CoopNet::CLIENT) return;
+	if(CoopNet::PacketsReceived() == 0) {
+		SetHint("G: not connected yet");
+		return;
+	}
+	if(!guestShared) {
+		SetHint("G: too far from the host, no shared world");
+		return;
+	}
+	if(pl->bInVehicle) {
+		SetHint("G: you are already in a vehicle");
+		return;
+	}
+
+	CVector pp = pl->GetPosition();
+	int bk = -1;
+	float bd = 6.0f;
+	for(int k = 0; k < MAX_VPUP; k++) {
+		if(vcar[k] == nil) continue;
+		float d = (vcar[k]->GetPosition() - pp).Magnitude();
+		if(d < bd) {
+			bd = d;
+			bk = k;
+		}
+	}
+	if(bk < 0) {
+		char b[96];
+		snprintf(b, sizeof b, "G: no host vehicle within 6 m (%d known)", dbgCars);
+		SetHint(b);
+		return;
+	}
+
+	CVehicle *car = vcar[bk];
+	bool driverSeatFree = (car->pDriver == nil);
+	if(!driverSeatFree && FreePassengerSlots(car) == 0) {
+		SetHint("G: that vehicle is full");
+		return;
+	}
+	if(SeatPed(pl, car, driverSeatFree))
+		SetHint(driverSeatFree ? "Sat in the driver seat" : "Entered as passenger");
+	else
+		SetHint("G: could not seat you (see the debug line)");
+}
+
+// call once per frame after the world update
+void
+Update()
+{
+	CoopNet::State st = CoopNet::GetState();
+
+	if(st == CoopNet::HOST && CoopNet::HasPeer()) {
+		HostSend();
+		return;
+	}
+	hostShared = false;
+	guestOwnedId = -1;
+
+	if(st == CoopNet::CLIENT && CoopNet::PacketsReceived() > 0) {
+		if(FindPlayerPed() == nil) return;
+		ApplyWorld();
+		if(guestShared) {
+			ClearLocalAmbient();
+			SyncVehicles();
+			SyncPeds();
+#if COOP_FIRE
+			SyncFires();
+#endif
+			GuestSendOwned();
+		} else {
+			RemoveAllPuppets();
+		}
+
+		dbgCars = dbgPeds = dbgSeated = 0;
+		for(int k = 0; k < MAX_VPUP; k++)
+			if(vcar[k]) dbgCars++;
+		for(int k = 0; k < MAX_PPUP; k++) {
+			if(pped[k]) {
+				dbgPeds++;
+				if(pveh[k] >= 0) dbgSeated++;
+			}
+		}
+		return;
+	}
+
+	guestShared = false;
+	RemoveAllPuppets();
+}
+
+} // namespace CoopWorld
