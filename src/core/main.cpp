@@ -10,6 +10,7 @@
 #endif
 
 #include "main.h"
+#include "Net.h"
 #include "CdStream.h"
 #include "General.h"
 #include "RwHelper.h"
@@ -1486,6 +1487,7 @@ Render2dStuff(void)
 	else
 #endif
 		CHud::Draw();
+	CoopMenu::Draw();
 
 	CSpecialFX::Render2DFXs();
 	CUserDisplay::OnscnTimer.ProcessForDisplay();
@@ -1600,6 +1602,7 @@ Idle(void *arg)
 		tbEndTimer("CnstrRenderList");
 
 		tbStartTimer(0, "PreRender");
+		CoopWorld::BeforePreRender(); 
 		CRenderer::PreRender();
 		tbEndTimer("PreRender");
 
@@ -1934,6 +1937,7 @@ void TheGame(void)
 
 			if ((!FrontEndMenuManager.m_bMenuActive || FrontEndMenuManager.m_bRenderGameInMenu == true) && TheCamera.GetScreenFadeStatus() != FADE_2 )
 			{
+				CoopWorld::BeforePreRender();
 				CRenderer::PreRender();
 				// TODO(MIAMI): something ps2all specific
 
