@@ -1,5 +1,6 @@
 <img src="https://github.com/mrxenginner/reVC/blob/miami/res/images/logo_1024.png?raw=true" alt="reVC logo" width="200">
 
+lol synced multiplayer and stuff, uhh, f5 and f3 do something, oh yeah it works over LAN or something idk ok bye
 ## Intro
 
 In this repository you'll find the fully reversed source code for GTA VC ([miami](https://github.com/mrxenginner/reVC/tree/miami/) branch).
